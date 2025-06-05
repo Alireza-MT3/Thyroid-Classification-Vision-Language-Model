@@ -8,11 +8,14 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from collections import defaultdict
 import json
+from skimage import exposure, filters, morphology
+from scipy import ndimage
+import seaborn as sns
 
-class ThyroidDicomProcessor:
+class EnhancedThyroidProcessor:
     def __init__(self, dataset_path):
         """
-        Initialize the DICOM processor
+        Enhanced DICOM processor for nuclear medicine thyroid images
         
         Args:
             dataset_path (str): Path to the Dataset folder
@@ -30,7 +33,14 @@ class ThyroidDicomProcessor:
         }
         self.dicom_data = defaultdict(list)
         self.image_data = defaultdict(list)
+        self.enhanced_data = defaultdict(list)
         self.metadata = defaultdict(list)
+        
+        # Enhancement parameters
+        self.target_size = (256, 256)  # Optimal for nuclear medicine images
+        self.clahe_clip_limit = 2.0
+        self.clahe_tile_grid_size = (8, 8)
+        self.gaussian_sigma = 0.8
     
     def read_dicom_files(self):
         """
@@ -65,7 +75,7 @@ class ThyroidDicomProcessor:
                     if hasattr(dicom_data, 'pixel_array'):
                         pixel_array = dicom_data.pixel_array
                         
-                        # Store image data
+                        # Store original image data
                         self.image_data[category_name].append({
                             'filename': dicom_file.name,
                             'image': pixel_array,
@@ -102,104 +112,279 @@ class ThyroidDicomProcessor:
         }
         return metadata
     
-    def normalize_image(self, image, method='minmax'):
+    def nuclear_medicine_enhancement(self, image):
         """
-        Normalize image pixel values
+        Apply specialized enhancement for nuclear medicine images
         
         Args:
             image: Input image array
-            method: Normalization method ('minmax', 'zscore', 'window')
+            
+        Returns:
+            Enhanced image array
         """
-        if method == 'minmax':
-            # Min-max normalization to 0-255
-            image_min, image_max = image.min(), image.max()
-            if image_max > image_min:
-                normalized = ((image - image_min) / (image_max - image_min) * 255).astype(np.uint8)
+        # Convert to float for processing
+        if image.dtype != np.float64:
+            img_float = image.astype(np.float64)
+        else:
+            img_float = image.copy()
+        
+        # Handle multi-dimensional images
+        if len(img_float.shape) == 3:
+            if img_float.shape[2] == 3:  # RGB
+                img_float = cv2.cvtColor(img_float.astype(np.uint8), cv2.COLOR_RGB2GRAY)
             else:
-                normalized = np.zeros_like(image, dtype=np.uint8)
+                img_float = img_float[:, :, 0]  # Take first channel
         
-        elif method == 'zscore':
-            # Z-score normalization then scale to 0-255
-            mean, std = image.mean(), image.std()
-            if std > 0:
-                normalized = (image - mean) / std
-                normalized = ((normalized - normalized.min()) / 
-                            (normalized.max() - normalized.min()) * 255).astype(np.uint8)
-            else:
-                normalized = np.zeros_like(image, dtype=np.uint8)
+        # Step 1: Normalize to 0-1 range
+        img_min, img_max = img_float.min(), img_float.max()
+        if img_max > img_min:
+            img_normalized = (img_float - img_min) / (img_max - img_min)
+        else:
+            img_normalized = np.zeros_like(img_float)
         
-        elif method == 'window':
-            # Windowing (if window center/width available)
-            # This would require metadata - simplified version here
-            normalized = np.clip(image, 0, np.percentile(image, 99))
-            normalized = ((normalized / normalized.max()) * 255).astype(np.uint8)
+        # Step 2: Apply Gaussian filtering for noise reduction
+        img_filtered = filters.gaussian(img_normalized, sigma=self.gaussian_sigma)
         
-        return normalized
+        # Step 3: Convert to uint8 for CLAHE
+        img_uint8 = (img_filtered * 255).astype(np.uint8)
+        
+        # Step 4: Apply CLAHE for contrast enhancement
+        clahe = cv2.createCLAHE(
+            clipLimit=self.clahe_clip_limit, 
+            tileGridSize=self.clahe_tile_grid_size
+        )
+        img_clahe = clahe.apply(img_uint8)
+        
+        # Step 5: Gamma correction for nuclear medicine images
+        # Nuclear medicine images often benefit from gamma < 1 to enhance uptake areas
+        gamma = 0.8
+        img_gamma = exposure.adjust_gamma(img_clahe / 255.0, gamma)
+        
+        # Step 6: Histogram equalization (adaptive)
+        img_eq = exposure.equalize_adapthist(img_gamma, clip_limit=0.03)
+        
+        # Step 7: Resize to target size
+        img_resized = cv2.resize(img_eq, self.target_size, interpolation=cv2.INTER_LANCZOS4)
+        
+        # Step 8: Final normalization to 0-255 range
+        img_final = ((img_resized - img_resized.min()) / 
+                    (img_resized.max() - img_resized.min()) * 255).astype(np.uint8)
+        
+        return img_final
     
-    def convert_to_png(self, output_dir, normalization_method='minmax', resize_shape=None):
+    def enhance_all_images(self):
         """
-        Convert DICOM images to PNG format
-        
-        Args:
-            output_dir (str): Output directory for PNG files
-            normalization_method (str): Method for normalization
-            resize_shape (tuple): Optional resize shape (width, height)
+        Apply enhancement to all loaded images
         """
-        output_path = Path(output_dir)
-        
-        print(f"Converting to PNG format...")
-        conversion_log = []
+        print("Applying nuclear medicine image enhancement...")
         
         for category_name, images in self.image_data.items():
-            category_output_path = output_path / category_name
-            category_output_path.mkdir(parents=True, exist_ok=True)
+            print(f"Enhancing {len(images)} images for category: {category_name}")
             
-            print(f"Processing {len(images)} images for category: {category_name}")
-            
-            for i, img_data in enumerate(images):
+            for img_data in images:
                 try:
-                    image = img_data['image']
-                    filename = Path(img_data['filename']).stem  # Remove .dcm extension
+                    original_image = img_data['image']
+                    enhanced_image = self.nuclear_medicine_enhancement(original_image)
                     
-                    # Handle different image dimensions
-                    if len(image.shape) == 3:
-                        # Multi-channel image - take first channel or convert to grayscale
-                        if image.shape[2] == 3:  # RGB
-                            image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-                        else:
-                            image = image[:, :, 0]  # Take first channel
-                    
-                    # Normalize the image
-                    normalized_image = self.normalize_image(image, normalization_method)
-                    
-                    # Resize if specified
-                    if resize_shape:
-                        normalized_image = cv2.resize(normalized_image, resize_shape)
-                    
-                    # Convert to PIL Image and save as PNG
-                    pil_image = Image.fromarray(normalized_image)
-                    png_filename = f"{filename}.png"
-                    png_path = category_output_path / png_filename
-                    pil_image.save(png_path)
-                    
-                    conversion_log.append({
-                        'category': category_name,
-                        'original_file': img_data['filename'],
-                        'png_file': png_filename,
+                    self.enhanced_data[category_name].append({
+                        'filename': img_data['filename'],
+                        'original_image': original_image,
+                        'enhanced_image': enhanced_image,
                         'original_shape': img_data['shape'],
-                        'final_shape': normalized_image.shape
+                        'enhanced_shape': enhanced_image.shape
                     })
                     
                 except Exception as e:
-                    print(f"Error converting {img_data['filename']}: {str(e)}")
+                    print(f"Error enhancing {img_data['filename']}: {str(e)}")
         
-        # Save conversion log
-        log_path = output_path / "conversion_log.json"
+        print("Enhancement completed!")
+    
+    def save_enhanced_images(self, output_dir, save_originals=False):
+        """
+        Save enhanced images to PNG format
+        
+        Args:
+            output_dir (str): Output directory for enhanced images
+            save_originals (bool): Whether to save original images as well
+        """
+        output_path = Path(output_dir)
+        enhanced_path = output_path / "enhanced"
+        
+        print(f"Saving enhanced images to {enhanced_path}")
+        
+        if save_originals:
+            original_path = output_path / "original"
+            original_path.mkdir(parents=True, exist_ok=True)
+        
+        save_log = []
+        
+        for category_name, images in self.enhanced_data.items():
+            # Create category directories
+            category_enhanced_path = enhanced_path / category_name
+            category_enhanced_path.mkdir(parents=True, exist_ok=True)
+            
+            if save_originals:
+                category_original_path = original_path / category_name
+                category_original_path.mkdir(parents=True, exist_ok=True)
+            
+            print(f"Saving {len(images)} enhanced images for category: {category_name}")
+            
+            for img_data in images:
+                try:
+                    filename_stem = Path(img_data['filename']).stem
+                    
+                    # Save enhanced image
+                    enhanced_filename = f"{filename_stem}_enhanced.png"
+                    enhanced_filepath = category_enhanced_path / enhanced_filename
+                    enhanced_pil = Image.fromarray(img_data['enhanced_image'])
+                    enhanced_pil.save(enhanced_filepath)
+                    
+                    # Save original image if requested
+                    if save_originals:
+                        original_image = img_data['original_image']
+                        if len(original_image.shape) == 3:
+                            original_image = original_image[:, :, 0]
+                        
+                        # Normalize original for saving
+                        orig_min, orig_max = original_image.min(), original_image.max()
+                        if orig_max > orig_min:
+                            original_normalized = ((original_image - orig_min) / 
+                                                 (orig_max - orig_min) * 255).astype(np.uint8)
+                        else:
+                            original_normalized = np.zeros_like(original_image, dtype=np.uint8)
+                        
+                        original_resized = cv2.resize(original_normalized, self.target_size)
+                        original_filename = f"{filename_stem}_original.png"
+                        original_filepath = category_original_path / original_filename
+                        original_pil = Image.fromarray(original_resized)
+                        original_pil.save(original_filepath)
+                    
+                    save_log.append({
+                        'category': category_name,
+                        'original_filename': img_data['filename'],
+                        'enhanced_filename': enhanced_filename,
+                        'original_shape': img_data['original_shape'],
+                        'enhanced_shape': img_data['enhanced_shape']
+                    })
+                    
+                except Exception as e:
+                    print(f"Error saving {img_data['filename']}: {str(e)}")
+        
+        # Save processing log
+        log_path = output_path / "enhancement_log.json"
         with open(log_path, 'w') as f:
-            json.dump(conversion_log, f, indent=2)
+            json.dump(save_log, f, indent=2)
         
-        print(f"PNG conversion completed. Files saved to: {output_path}")
-        print(f"Conversion log saved to: {log_path}")
+        print(f"Enhanced images saved to: {enhanced_path}")
+        print(f"Enhancement log saved to: {log_path}")
+    
+    def visualize_enhancement_comparison(self, samples_per_category=2, figsize=(20, 12)):
+        """
+        Visualize original vs enhanced images for comparison
+        """
+        categories = list(self.enhanced_data.keys())
+        n_categories = len(categories)
+        
+        if n_categories == 0:
+            print("No enhanced data available for visualization")
+            return
+        
+        # Create subplots: categories x samples x 2 (original vs enhanced)
+        fig, axes = plt.subplots(n_categories, samples_per_category * 2, 
+                               figsize=figsize, squeeze=False)
+        
+        for i, category in enumerate(categories):
+            images = self.enhanced_data[category]
+            n_samples = min(samples_per_category, len(images))
+            
+            for j in range(samples_per_category):
+                # Original image column
+                ax_orig = axes[i, j * 2]
+                # Enhanced image column  
+                ax_enh = axes[i, j * 2 + 1]
+                
+                if j < n_samples:
+                    # Original image
+                    orig_img = images[j]['original_image']
+                    if len(orig_img.shape) == 3:
+                        orig_img = orig_img[:, :, 0]
+                    
+                    # Normalize original for display
+                    orig_min, orig_max = orig_img.min(), orig_img.max()
+                    if orig_max > orig_min:
+                        orig_display = (orig_img - orig_min) / (orig_max - orig_min)
+                    else:
+                        orig_display = np.zeros_like(orig_img)
+                    
+                    ax_orig.imshow(orig_display, cmap='hot', aspect='equal')
+                    ax_orig.set_title(f"{category}\nOriginal")
+                    
+                    # Enhanced image
+                    enh_img = images[j]['enhanced_image']
+                    ax_enh.imshow(enh_img, cmap='hot', aspect='equal')
+                    ax_enh.set_title(f"{category}\nEnhanced")
+                else:
+                    ax_orig.set_title(f"{category}\nNo sample")
+                    ax_enh.set_title(f"{category}\nNo sample")
+                
+                ax_orig.axis('off')
+                ax_enh.axis('off')
+        
+        plt.tight_layout()
+        plt.suptitle('Nuclear Medicine Image Enhancement Comparison\n(Original vs Enhanced)', 
+                    fontsize=16, y=0.98)
+        plt.savefig("enhanced_sample")
+    
+    def analyze_enhancement_effects(self):
+        """
+        Analyze the effects of enhancement on image properties
+        """
+        print("\n" + "="*60)
+        print("ENHANCEMENT ANALYSIS")
+        print("="*60)
+        
+        enhancement_stats = {}
+        
+        for category_name, images in self.enhanced_data.items():
+            orig_contrasts = []
+            enh_contrasts = []
+            orig_means = []
+            enh_means = []
+            orig_stds = []
+            enh_stds = []
+            
+            for img_data in images:
+                # Original image stats
+                orig_img = img_data['original_image']
+                if len(orig_img.shape) == 3:
+                    orig_img = orig_img[:, :, 0]
+                
+                orig_contrasts.append(orig_img.std())
+                orig_means.append(orig_img.mean())
+                orig_stds.append(orig_img.std())
+                
+                # Enhanced image stats
+                enh_img = img_data['enhanced_image']
+                enh_contrasts.append(enh_img.std())
+                enh_means.append(enh_img.mean())
+                enh_stds.append(enh_img.std())
+            
+            enhancement_stats[category_name] = {
+                'original_contrast_mean': np.mean(orig_contrasts),
+                'enhanced_contrast_mean': np.mean(enh_contrasts),
+                'contrast_improvement': np.mean(enh_contrasts) / np.mean(orig_contrasts) if np.mean(orig_contrasts) > 0 else 0,
+                'original_intensity_mean': np.mean(orig_means),
+                'enhanced_intensity_mean': np.mean(enh_means),
+                'count': len(images)
+            }
+            
+            print(f"\n{category_name.upper()}:")
+            print(f"  Images: {len(images)}")
+            print(f"  Contrast improvement: {enhancement_stats[category_name]['contrast_improvement']:.2f}x")
+            print(f"  Original contrast (std): {enhancement_stats[category_name]['original_contrast_mean']:.2f}")
+            print(f"  Enhanced contrast (std): {enhancement_stats[category_name]['enhanced_contrast_mean']:.2f}")
+        
+        return enhancement_stats
     
     def print_summary(self):
         """
@@ -222,126 +407,39 @@ class ThyroidDicomProcessor:
                 print(f"  - Unique image shapes: {unique_shapes}")
         
         print(f"\nTotal files loaded: {total_files}")
-    
-    def get_category_data(self, category_name):
-        """
-        Get all data for a specific category
-        
-        Args:
-            category_name (str): Name of the category
-            
-        Returns:
-            dict: Dictionary containing images, dicom_objects, and metadata
-        """
-        return {
-            'images': self.image_data.get(category_name, []),
-            'dicom_objects': self.dicom_data.get(category_name, []),
-            'metadata': self.metadata.get(category_name, [])
-        }
-    
-    def visualize_samples(self, samples_per_category=2, figsize=(15, 10)):
-        """
-        Visualize sample images from each category
-        """
-        categories = list(self.image_data.keys())
-        n_categories = len(categories)
-        
-        if n_categories == 0:
-            print("No image data available for visualization")
-            return
-        
-        fig, axes = plt.subplots(n_categories, samples_per_category, 
-                               figsize=figsize, squeeze=False)
-        
-        for i, category in enumerate(categories):
-            images = self.image_data[category]
-            n_samples = min(samples_per_category, len(images))
-            
-            for j in range(samples_per_category):
-                ax = axes[i, j]
-                
-                if j < n_samples:
-                    img = images[j]['image']
-                    # Handle multi-dimensional images
-                    if len(img.shape) == 3:
-                        img = img[:, :, 0]  # Take first channel
-                    
-                    ax.imshow(img, cmap='gray')
-                    ax.set_title(f"{category}\n{images[j]['filename']}")
-                else:
-                    ax.set_title(f"{category}\n(No more samples)")
-                
-                ax.axis('off')
-        
-        plt.tight_layout()
-        plt.savefig("sample_visualization")
+        print(f"Target enhanced size: {self.target_size}")
 
-print("Done!")
+
 # Usage example
 def main():
-    # Initialize the processor
-    dataset_path = "/home/kherad/AlirezaMottaghi/Thyroid/Dataset"  # Adjust path as needed
-    processor = ThyroidDicomProcessor(dataset_path)
+    # Initialize the enhanced processor
+    dataset_path = "/home/kherad/AlirezaMottaghi/Thyroid/Dataset"  # Path relative to preprocessing script
+    processor = EnhancedThyroidProcessor(dataset_path)
     
-    # Read all DICOM files
+    # Step 1: Read all DICOM files
+    print("Step 1: Reading DICOM files...")
     processor.read_dicom_files()
     
-    # Convert to PNG
-    output_dir = "Thyroid/PNG_Dataset"
-    processor.convert_to_png(
-        output_dir=output_dir,
-        normalization_method='minmax',  # Options: 'minmax', 'zscore', 'window'
-        resize_shape=(512, 512)  # Optional: resize all images to 512x512
-    )
+    # Step 2: Apply enhancement to all images
+    print("\nStep 2: Applying nuclear medicine enhancement...")
+    processor.enhance_all_images()
     
-    # Visualize samples (optional)
-    processor.visualize_samples(samples_per_category=3)
+    # Step 3: Analyze enhancement effects
+    print("\nStep 3: Analyzing enhancement effects...")
+    enhancement_stats = processor.analyze_enhancement_effects()
     
-    # Access specific category data
-    normal_data = processor.get_category_data('normal')
-    print(f"Normal category has {len(normal_data['images'])} images")
+    # Step 4: Save enhanced images
+    print("\nStep 4: Saving enhanced images...")
+    output_dir = "/home/kherad/AlirezaMottaghi/Thyroid/ProcessedData"
+    processor.save_enhanced_images(output_dir, save_originals=True)
     
-    # Access the organized data
-    print("\nAvailable categories:")
-    for category in processor.image_data.keys():
-        print(f"- {category}: {len(processor.image_data[category])} images")
+    # Step 5: Visualize enhancement comparison
+    print("\nStep 5: Visualizing enhancement results...")
+    processor.visualize_enhancement_comparison(samples_per_category=2)
+    
+    print("\nEnhanced preprocessing completed successfully!")
+    print(f"Enhanced images saved to: {output_dir}/enhanced/")
+    print(f"Original images saved to: {output_dir}/original/")
 
 if __name__ == "__main__":
     main()
-
-
-# # Alternative simple function for quick loading
-# def load_thyroid_dicom_simple(dataset_path):
-#     """
-#     Simple function to quickly load DICOM files into a dictionary
-    
-#     Returns:
-#         dict: Dictionary with category names as keys and list of image arrays as values
-#     """
-#     categories = {
-#         '1. goiter-diffuse goiter': 'goiter_diffuse',
-#         '2. MNG': 'mng',
-#         '3. diffuse toxic goiter': 'diffuse_toxic_goiter',
-#         '4. thyroiditis': 'thyroiditis',
-#         '5. cold nodule': 'cold_nodule',
-#         '6. hot nodule': 'hot_nodule',
-#         '7. warm nodule': 'warm_nodule',
-#         '8. normal': 'normal'
-#     }
-    
-#     data = {}
-#     for folder, category in categories.items():
-#         category_path = Path(dataset_path) / folder
-#         if category_path.exists():
-#             images = []
-#             for dcm_file in category_path.glob("*.dcm"):
-#                 try:
-#                     dicom_data = pydicom.dcmread(str(dcm_file))
-#                     if hasattr(dicom_data, 'pixel_array'):
-#                         images.append(dicom_data.pixel_array)
-#                 except Exception as e:
-#                     print(f"Error reading {dcm_file}: {e}")
-#             data[category] = images
-#             print(f"Loaded {len(images)} images for {category}")
-    
-#     return data
